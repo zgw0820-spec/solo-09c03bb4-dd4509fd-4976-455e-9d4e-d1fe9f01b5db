@@ -41,12 +41,26 @@
   .round { font-size:14px; margin:6px 0; }
   .round b { color:#1f6feb; }
   .failcard { border:1px solid var(--bd); border-radius:6px; padding:10px 12px; margin-top:10px; }
+  .grid3 { display:grid; grid-template-columns:1fr 1fr 1fr; gap:12px; }
+  @media (max-width:900px){ .grid3{grid-template-columns:1fr;} }
+  input[type=text], select { width:100%; border:1px solid var(--bd); border-radius:6px;
+         padding:7px 9px; font-size:13px; font-family:ui-monospace,Consolas,monospace; }
+  ul.det { margin:8px 0; padding-left:20px; font-size:13px; }
+  ul.det li { margin:3px 0; }
+  .add { color:var(--ok); font-weight:600; }
+  .del { color:var(--bad); font-weight:600; }
+  .save-big { font-size:20px; font-weight:700; color:var(--ok); }
+  .twocol { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  @media (max-width:900px){ .twocol{grid-template-columns:1fr;} }
+  .dl { background:#1a7f37; }
+  .addr-chips { font-family:ui-monospace,Consolas,monospace; font-size:12px; color:#57606a;
+         word-break:break-all; margin-top:6px; }
 </style>
 </head>
 <body>
 <header>
-  <h1>备份专网出口切换 · 换表轮次规划器</h1>
-  <p>上传拓扑与换版前后静态路由表(≤8 台),给出轮次最少的整表切换计划;同轮任意完成顺序均保证保通要求。</p>
+  <h1>备份专网出口切换 · 换表轮次规划器 / 汇总路由试算</h1>
+  <p>上传拓扑与换版前后静态路由表(≤8 台),给出轮次最少的整表切换计划;也可在静态表快满时试加一条汇总路由,试算能净省多少表项。</p>
 </header>
 <main>
   <section>
@@ -83,8 +97,31 @@
     </div>
   </section>
 
+  <section>
+    <h2>3. 汇总路由试算(按勾选状态取全网当前用表,试加一条 IPv4 汇总前缀)</h2>
+    <div class="grid3">
+      <div>
+        <label class="f">选择设备</label>
+        <select id="sumRouter"><option value="">解析路由表后显示设备清单</option></select>
+      </div>
+      <div>
+        <label class="f">拟加汇总前缀(IPv4 CIDR)</label>
+        <input type="text" id="sumPrefix" placeholder="例如 10.1.0.0/16" spellcheck="false">
+      </div>
+      <div>
+        <label class="f">直连下一跳</label>
+        <input type="text" id="sumHop" placeholder="例如 10.0.12.2" spellcheck="false">
+      </div>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <button id="sumRun">试算能省多少表项</button>
+      <span class="hint">汇总前缀须是该设备当前表的新前缀,范围内最多 10 条更具体表项;核验"从任一路由器发往汇总范围内任一地址"的出口与断路/环路结论均不变。</span>
+    </div>
+    <div id="sumResult" style="margin-top:12px"></div>
+  </section>
+
   <section id="resultSec" style="display:none">
-    <h2>3. 结果</h2>
+    <h2>4. 换表计划结果</h2>
     <div id="result"></div>
   </section>
 </main>
@@ -115,11 +152,22 @@ function refreshChecks() {
   let names = [];
   try { names = Object.keys(JSON.parse($('routes').value)).sort(); } catch (e) {}
   const box = $('switchedChecks');
-  if (!names.length) { box.innerHTML = '<span class="hint">解析路由表后显示设备清单</span>'; return; }
-  const prev = new Set([...box.querySelectorAll('input:checked')].map(x => x.value));
-  box.innerHTML = names.map(n =>
-    `<label><input type="checkbox" value="${n}" ${prev.has(n) ? 'checked' : ''}> ${n}(已换)</label>`
-  ).join('');
+  if (!names.length) { box.innerHTML = '<span class="hint">解析路由表后显示设备清单</span>'; }
+  else {
+    const prev = new Set([...box.querySelectorAll('input:checked')].map(x => x.value));
+    box.innerHTML = names.map(n =>
+      `<label><input type="checkbox" value="${n}" ${prev.has(n) ? 'checked' : ''}> ${n}(已换)</label>`
+    ).join('');
+  }
+  // 汇总试算的设备下拉同步刷新,保留已选值
+  const sel = $('sumRouter');
+  const oldVal = sel.value;
+  if (!names.length) {
+    sel.innerHTML = '<option value="">解析路由表后显示设备清单</option>';
+  } else {
+    sel.innerHTML = names.map(n =>
+      `<option value="${n}" ${n === oldVal ? 'selected' : ''}>${n}</option>`).join('');
+  }
 }
 ['topology','routes','requirements'].forEach(id => $(id).addEventListener('input', refreshChecks));
 
@@ -187,6 +235,113 @@ $('run').addEventListener('click', async () => {
 });
 
 refreshChecks();
+
+// ----------------------------------------------------------- 汇总路由试算
+function routeList(items, cls) {
+  if (!items || !items.length) return '<span class="hint">(无)</span>';
+  return '<ul class="det">' + items.map(r =>
+    `<li class="${cls}"><span class="mono">${esc(r.prefix)}</span> → <span class="mono">${esc(r.next_hop)}</span></li>`
+  ).join('') + '</ul>';
+}
+
+function verdictTag(v) {
+  const zh = {ok:'正常', blackhole:'断路', loop:'环路', wrong_egress:'错出口'};
+  return `<span class="tag ${v}">${esc(zh[v] ?? v)}</span>`;
+}
+
+function divergenceCard(dv) {
+  if (!dv) return '';
+  return `
+  <div class="failcard">
+    <div><b>不一致证据</b>:从入口 <span class="mono">${esc(dv.ingress)}</span>
+      发往地址 <span class="mono">${esc(dv.address)}</span></div>
+    <div class="twocol" style="margin-top:8px">
+      <div><b>修改前</b>:${verdictTag(dv.before_verdict)}
+        ${dv.before_egress ? ` 出口 <span class="mono">${esc(dv.before_egress)}</span>` : ''}
+        ${pathTable(dv.before_path, dv.before_verdict)}</div>
+      <div><b>修改后</b>:${verdictTag(dv.after_verdict)}
+        ${dv.after_egress ? ` 出口 <span class="mono">${esc(dv.after_egress)}</span>` : ''}
+        ${pathTable(dv.after_path, dv.after_verdict)}</div>
+    </div>
+  </div>`;
+}
+
+$('sumRun').addEventListener('click', async () => {
+  const out = $('sumResult');
+  let body;
+  try {
+    body = {
+      topology: JSON.parse($('topology').value),
+      routes: JSON.parse($('routes').value),
+      requirements: (() => { const t = $('requirements').value.trim(); return t ? JSON.parse(t) : null; })(),
+      switched: [...$('switchedChecks').querySelectorAll('input:checked')].map(x => x.value),
+      router: $('sumRouter').value,
+      summary_prefix: $('sumPrefix').value.trim(),
+      next_hop: $('sumHop').value.trim(),
+    };
+  } catch (e) {
+    out.innerHTML = `<div class="err">JSON 解析失败:${esc(e.message)}(已保留您的全部输入)</div>`;
+    return;
+  }
+  out.innerHTML = '<p class="hint">试算中……(输入均保留)</p>';
+  let resp, d;
+  try {
+    resp = await fetch('/api/summarize', {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
+    });
+    d = await resp.json();
+  } catch (e) {
+    out.innerHTML = `<div class="err">请求失败:${esc(e.message)}</div>`;
+    return;
+  }
+  if (!resp.ok) {
+    out.innerHTML = `<div class="err">输入校验失败:${esc(d.detail ?? resp.status)}<br>
+      <span class="hint">页面输入已保留,修改后可直接重试。</span></div>`;
+    return;
+  }
+
+  const base = `
+    <div>设备 <b class="mono">${esc(d.router)}</b> · 汇总前缀 <b class="mono">${esc(d.summary_prefix)}</b>
+      · 下一跳 <b class="mono">${esc(d.next_hop)}</b>
+      ${d.switched && d.switched.length ? ` · 按已换勾选取当前表(${d.switched.map(esc).join('、')} 用 after 版)` : ' · 全网均未勾选,当前表为 before 版'}</div>
+    <div class="hint">范围内更具体表项 ${d.candidates.length} 条;核验等价地址 ${d.checked_addresses.length} 个:
+      <span class="addr-chips">${d.checked_addresses.map(esc).join(' , ')}</span></div>`;
+
+  if (d.feasible) {
+    const fname = `routes_${d.router}_summary.json`;
+    const versionHint = d.switched.includes(d.router) ? 'after' : 'before';
+    out.innerHTML = `
+      <div class="okbox">
+        <div class="save-big">净省 ${d.saved} 个表项</div>
+        <div style="margin:6px 0">${esc(d.message)}</div>
+        ${base}
+        <div class="twocol" style="margin-top:8px">
+          <div><b class="add">新增(+${d.added.length})</b>${routeList(d.added, 'add')}</div>
+          <div><b class="del">删除(-${d.deleted.length})</b>${routeList(d.deleted, 'del')}</div>
+        </div>
+        <div>表项数:<span class="mono">${d.table_size_before} → ${d.table_size_after}</span></div>
+        <div class="row" style="margin-top:10px">
+          <button class="dl" id="sumDownload">下载可重新上传的路由表 JSON</button>
+          <span class="hint">文件名 <span class="mono">${esc(fname)}</span>,仅替换 ${esc(d.router)} 的当前版(${versionHint}),其余设备原样保留。</span>
+        </div>
+      </div>`;
+    $('sumDownload').addEventListener('click', () => {
+      const blob = new Blob([JSON.stringify(d.new_routes, null, 2)], {type: 'application/json'});
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = fname;
+      a.click();
+      URL.revokeObjectURL(a.href);
+    });
+  } else {
+    out.innerHTML = `
+      <div class="badbox"><b>省不下来</b> — ${esc(d.message)}
+        ${base}
+        ${d.candidates.length ? `<div style="margin-top:6px">范围内候选表项:${routeList(d.candidates, '')}</div>` : ''}
+      </div>
+      ${divergenceCard(d.divergence)}`;
+  }
+});
 </script>
 </body>
 </html>

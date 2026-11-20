@@ -114,13 +114,16 @@ def _parse_routes(items, what: str) -> list[Route]:
     return routes
 
 
-def build_model(topology: dict, routes: dict, requirements: dict) -> Model:
-    """把上传的三个 JSON 对象校验并组装成模型。"""
+def build_model(topology: dict, routes: dict, requirements: dict | None = None) -> Model:
+    """把上传的三个 JSON 对象校验并组装成模型。
+
+    requirements 为 None 时只组装拓扑与路由表(汇总路由试算不需要保通要求)。
+    """
     if not isinstance(topology, dict):
         raise InputError("拓扑必须是 JSON 对象")
     if not isinstance(routes, dict):
         raise InputError("路由表必须是 JSON 对象")
-    if not isinstance(requirements, dict):
+    if requirements is not None and not isinstance(requirements, dict):
         raise InputError("保通要求必须是 JSON 对象")
 
     # ---- 链路
@@ -176,26 +179,27 @@ def build_model(topology: dict, routes: dict, requirements: dict) -> Model:
 
     # ---- 保通要求
     reqs = []
-    items = requirements.get("requirements")
-    if not isinstance(items, list) or not items:
-        raise InputError("保通要求 requirements 必须是非空数组")
-    for i, item in enumerate(items):
-        try:
-            name = str(item.get("name", f"req{i+1}"))
-            ingress = str(item["ingress"])
-            target = _v4net(str(item["target"]), f"requirements[{i}].target")
-            allowed = item["allowed_egress"]
-        except (KeyError, TypeError) as exc:
-            raise InputError(f"requirements[{i}] 需要 ingress、target、allowed_egress 字段") from exc
-        if ingress not in rset:
-            raise InputError(f"要求 {name} 的入口路由器不存在: {ingress}")
-        if not isinstance(allowed, list) or not allowed:
-            raise InputError(f"要求 {name} 的 allowed_egress 必须是非空数组")
-        allowed = {str(x) for x in allowed}
-        unknown = allowed - seen_egress
-        if unknown:
-            raise InputError(f"要求 {name} 引用了不存在的出口: {sorted(unknown)}")
-        reqs.append(Requirement(name, ingress, target, allowed))
+    if requirements is not None:
+        items = requirements.get("requirements")
+        if not isinstance(items, list) or not items:
+            raise InputError("保通要求 requirements 必须是非空数组")
+        for i, item in enumerate(items):
+            try:
+                name = str(item.get("name", f"req{i+1}"))
+                ingress = str(item["ingress"])
+                target = _v4net(str(item["target"]), f"requirements[{i}].target")
+                allowed = item["allowed_egress"]
+            except (KeyError, TypeError) as exc:
+                raise InputError(f"requirements[{i}] 需要 ingress、target、allowed_egress 字段") from exc
+            if ingress not in rset:
+                raise InputError(f"要求 {name} 的入口路由器不存在: {ingress}")
+            if not isinstance(allowed, list) or not allowed:
+                raise InputError(f"要求 {name} 的 allowed_egress 必须是非空数组")
+            allowed = {str(x) for x in allowed}
+            unknown = allowed - seen_egress
+            if unknown:
+                raise InputError(f"要求 {name} 引用了不存在的出口: {sorted(unknown)}")
+            reqs.append(Requirement(name, ingress, target, allowed))
 
     # ---- 每台路由器的下一跳解析表(链路对端 + 本机出口),最长前缀优先
     resolve: dict[str, list[tuple[ipaddress.IPv4Network, tuple[str, str]]]] = {r: [] for r in routers}
