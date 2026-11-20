@@ -1,0 +1,10 @@
+{
+  "requirements": [
+    {
+      "name": "业务到备份专网",
+      "ingress": "R1",
+      "target": "10.1.0.0/16",
+      "allowed_egress": ["E1", "E2"]
+    }
+  ]
+}

@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>备份专网出口切换 · 换表轮次规划器</title>
+<style>
+  :root { --bd:#c9d1d9; --ok:#1a7f37; --bad:#cf222e; --warn:#9a6700; --bg:#f6f8fa; }
+  * { box-sizing: border-box; }
+  body { font-family: "PingFang SC","Microsoft YaHei",system-ui,sans-serif; margin:0; background:var(--bg); color:#1f2328; }
+  header { background:#0d2149; color:#fff; padding:14px 24px; }
+  header h1 { margin:0; font-size:18px; }
+  header p { margin:4px 0 0; font-size:12px; opacity:.8; }
+  main { max-width:1180px; margin:0 auto; padding:16px 24px 48px; }
+  section { background:#fff; border:1px solid var(--bd); border-radius:8px; padding:16px; margin-bottom:16px; }
+  h2 { font-size:15px; margin:0 0 12px; }
+  .cols { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; }
+  @media (max-width:900px){ .cols{grid-template-columns:1fr;} }
+  label.f { display:block; font-size:13px; font-weight:600; margin-bottom:4px; }
+  textarea { width:100%; height:220px; font-family:ui-monospace,Consolas,monospace; font-size:12px;
+             border:1px solid var(--bd); border-radius:6px; padding:8px; resize:vertical; }
+  input[type=file]{ font-size:12px; margin-top:4px; }
+  button { background:#1f6feb; color:#fff; border:0; border-radius:6px; padding:8px 18px;
+           font-size:14px; cursor:pointer; }
+  button.ghost { background:#fff; color:#1f6feb; border:1px solid #1f6feb; }
+  button:hover { filter:brightness(1.08); }
+  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  .checks label { display:inline-block; margin:4px 14px 4px 0; font-size:14px; }
+  .hint { font-size:12px; color:#57606a; }
+  .err { background:#ffebe9; border:1px solid #ff818266; color:var(--bad); border-radius:6px;
+         padding:10px 12px; font-size:13px; white-space:pre-wrap; }
+  .okbox { background:#dafbe1; border:1px solid #4ac26b66; border-radius:6px; padding:10px 12px; }
+  .badbox { background:#ffebe9; border:1px solid #ff818266; border-radius:6px; padding:10px 12px; }
+  table { border-collapse:collapse; width:100%; font-size:13px; margin-top:8px; }
+  th,td { border:1px solid var(--bd); padding:6px 10px; text-align:left; }
+  th { background:var(--bg); }
+  .tag { display:inline-block; border-radius:10px; padding:1px 10px; font-size:12px; color:#fff; }
+  .tag.ok { background:var(--ok);} .tag.loop{ background:var(--bad);} .tag.blackhole{ background:var(--warn);}
+  .tag.wrong_egress{ background:#8250df;}
+  .mono { font-family:ui-monospace,Consolas,monospace; }
+  .round { font-size:14px; margin:6px 0; }
+  .round b { color:#1f6feb; }
+  .failcard { border:1px solid var(--bd); border-radius:6px; padding:10px 12px; margin-top:10px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>备份专网出口切换 · 换表轮次规划器</h1>
+  <p>上传拓扑与换版前后静态路由表(≤8 台),给出轮次最少的整表切换计划;同轮任意完成顺序均保证保通要求。</p>
+</header>
+<main>
+  <section>
+    <h2>1. 输入数据(JSON,可上传文件或直接粘贴)</h2>
+    <div class="cols">
+      <div>
+        <label class="f">拓扑(链路 / 出口)</label>
+        <textarea id="topology" spellcheck="false"></textarea>
+        <input type="file" accept=".json" data-target="topology">
+      </div>
+      <div>
+        <label class="f">路由表(每台 before / after)</label>
+        <textarea id="routes" spellcheck="false"></textarea>
+        <input type="file" accept=".json" data-target="routes">
+      </div>
+      <div>
+        <label class="f">保通要求(入口 / 目标 CIDR / 允许出口)</label>
+        <textarea id="requirements" spellcheck="false"></textarea>
+        <input type="file" accept=".json" data-target="requirements">
+      </div>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <button class="ghost" id="loadExample">载入示例</button>
+      <span class="hint">出口 = 挂在某台路由器上的外部下一跳子网;静态路由 next_hop 落在链路子网即转发给对端,落在出口子网即从该出口出网。</span>
+    </div>
+  </section>
+
+  <section>
+    <h2>2. 已换设备(现场只换完一部分时勾选,再点生成即中途续排)</h2>
+    <div class="checks" id="switchedChecks"><span class="hint">解析路由表后显示设备清单</span></div>
+    <div class="row" style="margin-top:10px">
+      <button id="run">生成计划 / 按勾选续排</button>
+      <span class="hint">目标网段按所有表项切分为等价区间,逐类验证"网段内任一地址"。</span>
+    </div>
+  </section>
+
+  <section id="resultSec" style="display:none">
+    <h2>3. 结果</h2>
+    <div id="result"></div>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+
+document.querySelectorAll('input[type=file]').forEach(inp => {
+  inp.addEventListener('change', () => {
+    const f = inp.files[0];
+    if (!f) return;
+    const rd = new FileReader();
+    rd.onload = () => { $(inp.dataset.target).value = rd.result; refreshChecks(); };
+    rd.readAsText(f);
+  });
+});
+
+$('loadExample').addEventListener('click', async () => {
+  const r = await fetch('/api/example');
+  const d = await r.json();
+  $('topology').value = JSON.stringify(d.topology, null, 2);
+  $('routes').value = JSON.stringify(d.routes, null, 2);
+  $('requirements').value = JSON.stringify(d.requirements, null, 2);
+  refreshChecks();
+});
+
+function refreshChecks() {
+  let names = [];
+  try { names = Object.keys(JSON.parse($('routes').value)).sort(); } catch (e) {}
+  const box = $('switchedChecks');
+  if (!names.length) { box.innerHTML = '<span class="hint">解析路由表后显示设备清单</span>'; return; }
+  const prev = new Set([...box.querySelectorAll('input:checked')].map(x => x.value));
+  box.innerHTML = names.map(n =>
+    `<label><input type="checkbox" value="${n}" ${prev.has(n) ? 'checked' : ''}> ${n}(已换)</label>`
+  ).join('');
+}
+['topology','routes','requirements'].forEach(id => $(id).addEventListener('input', refreshChecks));
+
+function esc(s){ return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+function pathTable(path, verdict) {
+  const rows = path.map((h, i) => {
+    let to = '—';
+    if (h.to_kind === 'router') to = '路由器 ' + esc(h.to_name);
+    else if (h.to_kind === 'egress') to = '出口 ' + esc(h.to_name);
+    let note = '';
+    if (verdict === 'loop' && i === path.length - 1) note = ' ← 环路:回到已路过的路由器';
+    if (verdict === 'blackhole' && i === path.length - 1) note = h.matched_prefix ? ' ← 断路:下一跳不可解析' : ' ← 断路:无匹配路由';
+    if (verdict === 'wrong_egress' && i === path.length - 1) note = ' ← 错出口:不在允许集合内';
+    return `<tr><td>${i + 1}</td><td class="mono">${esc(h.router)}</td>` +
+           `<td class="mono">${esc(h.matched_prefix ?? '(无匹配)')}</td>` +
+           `<td class="mono">${esc(h.next_hop ?? '—')}</td><td>${to}${note}</td></tr>`;
+  }).join('');
+  return `<table><tr><th>跳</th><th>路由器</th><th>匹配前缀</th><th>下一跳</th><th>发往</th></tr>${rows}</table>`;
+}
+
+$('run').addEventListener('click', async () => {
+  const out = $('result'), sec = $('resultSec');
+  sec.style.display = 'block';
+  let body;
+  try {
+    body = {
+      topology: JSON.parse($('topology').value),
+      routes: JSON.parse($('routes').value),
+      requirements: JSON.parse($('requirements').value),
+      switched: [...$('switchedChecks').querySelectorAll('input:checked')].map(x => x.value),
+    };
+  } catch (e) {
+    out.innerHTML = `<div class="err">JSON 解析失败:${esc(e.message)}</div>`;
+    return;
+  }
+  out.innerHTML = '<p class="hint">计算中……</p>';
+  const resp = await fetch('/api/plan', {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
+  });
+  const d = await resp.json();
+  if (!resp.ok) { out.innerHTML = `<div class="err">输入校验失败:${esc(d.detail ?? resp.status)}</div>`; return; }
+
+  if (d.status === 'ok') {
+    const rounds = d.rounds.map((r, i) =>
+      `<div class="round"><b>第 ${i + 1} 轮</b>:${r.map(esc).join('、')}
+       <span class="tag ok">同轮任意完成顺序均安全</span></div>`).join('');
+    out.innerHTML = `<div class="okbox"><b>计划生成成功</b> — ${esc(d.message)}
+      ${d.switched.length ? `<div>已换设备(续排起点):${d.switched.map(esc).join('、')}</div>` : ''}
+      ${rounds}</div>`;
+  } else {
+    const reasonZh = d.reason === 'current_unsafe' ? '当前不通' : '无法安全换完';
+    const fails = d.failures.map(f => `
+      <div class="failcard">
+        <div>要求:<b>${esc(f.requirement)}</b> · 入口 <span class="mono">${esc(f.ingress)}</span>
+          · 目标地址 <span class="mono">${esc(f.target_address)}</span>
+          · 结论 <span class="tag ${f.verdict}">${esc(f.verdict_zh)}</span>
+          ${f.egress ? ` · 实际出口 <span class="mono">${esc(f.egress)}</span>` : ''}</div>
+        ${pathTable(f.path, f.verdict)}
+      </div>`).join('');
+    out.innerHTML = `<div class="badbox"><b>失败状态:${reasonZh}</b> — ${esc(d.message)}
+      <div>失败状态下的已换设备:${d.failure_state.length ? d.failure_state.map(esc).join('、') : '(无)'}</div></div>
+      ${fails}`;
+  }
+});
+
+refreshChecks();
+</script>
+</body>
+</html>
